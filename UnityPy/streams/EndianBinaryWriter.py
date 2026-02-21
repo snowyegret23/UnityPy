@@ -38,6 +38,19 @@ class EndianBinaryWriter:
     def dispose(self):
         self.stream.close()
 
+    def write_stream(self, source: IOBase, chunk_size: int = 1048576):
+        """Copy contents of *source* stream into this writer without
+        materialising the whole source as a single ``bytes`` object.
+        This is the memory-friendly alternative to
+        ``self.write_bytes(source_writer.bytes)``.
+        """
+        source.seek(0)
+        while True:
+            chunk = source.read(chunk_size)
+            if not chunk:
+                break
+            self.write(chunk)
+
     def write(self, *args):
         if self.Position != self.stream.tell():
             self.stream.seek(self.Position)

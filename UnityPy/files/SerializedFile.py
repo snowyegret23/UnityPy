@@ -473,9 +473,11 @@ class SerializedFile(File.File):
                 writer.write_long(data_offset)
                 writer.write_long(self.unknown)
 
-            writer.write_bytes(meta_writer.bytes)
+            writer.write_stream(meta_writer.stream)
+            meta_writer.dispose()
             writer.align_stream(16)
-            writer.write_bytes(data_writer.bytes)
+            writer.write_stream(data_writer.stream)
+            data_writer.dispose()
 
         else:
             metadata_size += 1  # endian boolean
@@ -486,9 +488,11 @@ class SerializedFile(File.File):
             # reader.Position = header.file_size - header.metadata_size
             # so data follows right after this header -> after 32
             writer.write_u_int(32)
-            writer.write_bytes(data_writer.bytes)
+            writer.write_stream(data_writer.stream)
+            data_writer.dispose()
             writer.write_boolean(">" == header.endian)
-            writer.write_bytes(meta_writer.bytes)
+            writer.write_stream(meta_writer.stream)
+            meta_writer.dispose()
 
         return writer.bytes
 

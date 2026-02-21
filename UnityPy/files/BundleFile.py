@@ -1,4 +1,5 @@
 # TODO: implement encryption for saving files
+import os
 import re
 from collections import namedtuple
 from typing import Optional, Union, cast
@@ -234,6 +235,45 @@ class BundleFile(File.File):
             else:
                 raise NotImplementedError("UnityFS - Packer:", packer)
         return writer.bytes
+
+    def save_to(self, path, packer=None):
+        """Save directly to a file, avoiding the final in-memory bytes copy.
+
+        Returns the size of the written file in bytes.
+
+        packer: same options as save().
+        """
+        with open(path, "wb") as f:
+            writer = EndianBinaryWriter(f)
+
+            writer.write_string_to_null(self.signature)
+            writer.write_u_int(self.version)
+            writer.write_string_to_null(self.version_player)
+            writer.write_string_to_null(self.version_engine)
+
+            if self.signature == "UnityArchive":
+                raise NotImplementedError("BundleFile - UnityArchive")
+            elif self.signature in ["UnityWeb", "UnityRaw"]:
+                self.save_web_raw(writer)
+            elif self.signature == "UnityFS":
+                if not packer or packer == "none":
+                    self.save_fs(writer, 64, 64)
+                elif packer == "original":
+                    self.save_fs(
+                        writer,
+                        data_flag=self.dataflags,
+                        block_info_flag=self._block_info_flags,
+                    )
+                elif packer == "lz4":
+                    self.save_fs(writer, data_flag=194, block_info_flag=2)
+                elif packer == "lzma":
+                    self.save_fs(writer, data_flag=65, block_info_flag=1)
+                elif isinstance(packer, tuple):
+                    self.save_fs(writer, *packer)
+                else:
+                    raise NotImplementedError("UnityFS - Packer:", packer)
+
+        return os.path.getsize(path)
 
     def save_fs(self, writer: EndianBinaryWriter, data_flag: int, block_info_flag: int):
         # header
