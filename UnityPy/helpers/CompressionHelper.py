@@ -1,7 +1,7 @@
 import gzip
 import lzma
 import struct
-from typing import Callable, Dict, Tuple, Union
+from typing import Callable, Dict, Iterable, Tuple, Union
 
 import brotli
 import lz4.block
@@ -231,6 +231,77 @@ def chunk_based_compress(data: ByteString, block_info_flag: int) -> Tuple[ByteSt
     return bytes(compressed_file_data), block_info
 
 
+
+
+def chunk_based_compress_iter(chunks: Iterable[ByteString], block_info_flag: int) -> Tuple[ByteString, list]:
+    """compresses AssetBundle data from an iterable of chunks.
+    This avoids creating one huge temporary uncompressed bytes blob before compression.
+
+    :param chunks: iterable of uncompressed data chunks
+    :type chunks: Iterable[ByteString]
+    :param block_info_flag: block info flag
+    :type block_info_flag: int
+    :return: compressed data and block info
+    :rtype: tuple
+    """
+    switch = block_info_flag & 0x3F
+    if switch == 0:  # NONE
+        raw_data = bytearray()
+        total_size = 0
+        for chunk in chunks:
+            if not chunk:
+                continue
+            raw_data.extend(chunk)
+            total_size += len(chunk)
+        return raw_data, [(total_size, total_size, block_info_flag)]
+
+    if switch in COMPRESSION_MAP:
+        compress_func = COMPRESSION_MAP[switch]
+    else:
+        raise NotImplementedError(f"No compression function in the CompressionHelper.COMPRESSION_MAP for {switch}")
+
+    if switch in COMPRESSION_CHUNK_SIZE_MAP:
+        chunk_size = COMPRESSION_CHUNK_SIZE_MAP[switch]
+    else:
+        raise NotImplementedError(f"No chunk size in the CompressionHelper.COMPRESSION_CHUNK_SIZE_MAP for {switch}")
+
+    block_info = []
+    compressed_file_data = bytearray()
+    pending = bytearray()
+
+    for chunk in chunks:
+        if not chunk:
+            continue
+
+        view = memoryview(chunk)
+        p = 0
+        while p < len(view):
+            to_copy = min(chunk_size - len(pending), len(view) - p)
+            pending.extend(view[p : p + to_copy])
+            p += to_copy
+
+            if len(pending) == chunk_size:
+                compressed_data = compress_func(pending)
+                if len(compressed_data) > chunk_size:
+                    compressed_file_data.extend(pending)
+                    block_info.append((chunk_size, chunk_size, block_info_flag ^ switch))
+                else:
+                    compressed_file_data.extend(compressed_data)
+                    block_info.append((chunk_size, len(compressed_data), block_info_flag))
+                pending.clear()
+
+    if pending:
+        pending_size = len(pending)
+        compressed_data = compress_func(pending)
+        if len(compressed_data) > pending_size:
+            compressed_file_data.extend(pending)
+            block_info.append((pending_size, pending_size, block_info_flag ^ switch))
+        else:
+            compressed_file_data.extend(compressed_data)
+            block_info.append((pending_size, len(compressed_data), block_info_flag))
+
+    return compressed_file_data, block_info
+
 def decompress_lzham(data: ByteString, uncompressed_size: int) -> bytes:
     raise NotImplementedError("Custom compression or unimplemented LZHAM (removed by Unity) encountered!")
 
@@ -269,6 +340,7 @@ __all__ = (
     "decompress_lzma",
     "decompress_lzham",
     "chunk_based_compress",
+    "chunk_based_compress_iter",
     "COMPRESSION_MAP",
     "DECOMPRESSION_MAP",
     "COMPRESSION_CHUNK_SIZE_MAP",

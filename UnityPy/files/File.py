@@ -75,10 +75,21 @@ class File:
 
     def read_files(self, reader: EndianBinaryReader, files: list):
         # read file data and convert it
+        is_memory_reader = hasattr(reader, "view")
+        base_offset = reader.BaseOffset
+
         for node in files:
-            reader.Position = node.offset
             name = node.path
-            node_reader = EndianBinaryReader(reader.read(node.size), offset=(reader.BaseOffset + node.offset))
+            node_offset = node.offset
+
+            if is_memory_reader:
+                # Avoid a huge temporary bytes copy for every node in large bundles.
+                node_data = reader.view[node_offset : node_offset + node.size]
+                node_reader = EndianBinaryReader(node_data, offset=(base_offset + node_offset))
+            else:
+                reader.Position = node_offset
+                node_reader = EndianBinaryReader(reader.read(node.size), offset=(base_offset + node_offset))
+
             f = ImportHelper.parse_file(node_reader, self, name, is_dependency=self.is_dependency)
 
             if isinstance(f, (EndianBinaryReader, SerializedFile.SerializedFile)):

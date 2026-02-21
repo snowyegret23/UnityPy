@@ -285,28 +285,23 @@ class BundleFile(File.File):
 
         # file list & file data
         # prep nodes and build up block data
-        data_writer = EndianBinaryWriter()
-        files = [
-            (
-                name,
-                f.flags,
-                data_writer.write_bytes(
-                    f.bytes if isinstance(f, (EndianBinaryReader, EndianBinaryWriter)) else f.save()
-                ),
-            )
-            for name, f in self.files.items()
-        ]
+        files = []
 
-        file_data = data_writer.bytes
-        data_writer.dispose()
+        def iter_file_data():
+            for name, f in self.files.items():
+                file_data = f.bytes if isinstance(f, (EndianBinaryReader, EndianBinaryWriter)) else f.save()
+                files.append((name, f.flags, len(file_data)))
+                yield file_data
 
-        # remove encryption flag, as encryption isn't done
+        # remove encryption flag, as encryption is not applied by UnityPy during save
         if block_info_flag & self.dataflags.UsesAssetBundleEncryption:
             block_info_flag ^= self.dataflags.UsesAssetBundleEncryption
         if data_flag & self.dataflags.UsesAssetBundleEncryption:
             data_flag ^= self.dataflags.UsesAssetBundleEncryption
 
-        file_data, block_info = CompressionHelper.chunk_based_compress(file_data, block_info_flag)
+        # Stream file payloads directly into chunk compression to avoid one huge temporary
+        # uncompressed bundle blob in memory before compression.
+        file_data, block_info = CompressionHelper.chunk_based_compress_iter(iter_file_data(), block_info_flag)
 
         # write the block_info
         # uncompressedDataHash
