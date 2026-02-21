@@ -522,7 +522,9 @@ class SerializedFile(File.File):
             # data_writer is the same object as file_backed_data_writer
 
             with open(path, "wb") as out:
-                writer = EndianBinaryWriter(out, endian=self.header.endian)
+                # SerializedFile top-level header fields are written in big-endian
+                # (same behavior as save()), regardless of metadata endian.
+                writer = EndianBinaryWriter(out)
                 self._assemble(writer, meta_writer, data_writer)
             # _assemble already disposed data_writer (closes the temp file)
         finally:
