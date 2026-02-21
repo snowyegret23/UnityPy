@@ -386,14 +386,17 @@ class SerializedFile(File.File):
 
         return cab
 
-    def save(self, packer: Optional[str] = None) -> bytes:
-        # 1. header -> has to be delayed until the very end
-        # 2. data -> types, objects, scripts, ...
+    def _build_meta_and_data(self, data_writer: Optional[EndianBinaryWriter] = None):
+        """Serialize metadata and object data into two EndianBinaryWriters.
+        Returns (meta_writer, data_writer).
 
-        # so write the data first
+        If *data_writer* is provided it is used as-is (e.g. backed by a
+        temporary file for memory-constrained saves).
+        """
         header = self.header
         meta_writer = EndianBinaryWriter(endian=header.endian)
-        data_writer = EndianBinaryWriter(endian=header.endian)
+        if data_writer is None:
+            data_writer = EndianBinaryWriter(endian=header.endian)
 
         if header.version >= 7:
             meta_writer.write_string_to_null(self.unity_version)
@@ -439,8 +442,13 @@ class SerializedFile(File.File):
             assert self.userInformation is not None
             meta_writer.write_string_to_null(self.userInformation)
 
-        # prepare header
-        writer = EndianBinaryWriter()
+        return meta_writer, data_writer
+
+    def _assemble(self, writer: EndianBinaryWriter, meta_writer: EndianBinaryWriter, data_writer: EndianBinaryWriter):
+        """Write header + metadata + object data into *writer*,
+        then dispose the intermediate writers to free memory.
+        """
+        header = self.header
         header_size = 16  # 4*4
         metadata_size = meta_writer.Length
         data_size = data_writer.Length
@@ -455,13 +463,10 @@ class SerializedFile(File.File):
                 writer.write_u_int(metadata_size)
                 writer.write_u_int(file_size)
                 writer.write_u_int(header.version)
-                # reader.Position = header.file_size - header.metadata_size
-                # so data follows right after this header -> after 32
                 writer.write_u_int(data_offset)
                 writer.write_boolean(">" == header.endian)
                 writer.write_bytes(header.reserved)
             else:
-                # old header
                 writer.write_u_int(0)
                 writer.write_u_int(0)
                 writer.write_u_int(header.version)
@@ -485,8 +490,6 @@ class SerializedFile(File.File):
             writer.write_u_int(metadata_size)
             writer.write_u_int(file_size)
             writer.write_u_int(header.version)
-            # reader.Position = header.file_size - header.metadata_size
-            # so data follows right after this header -> after 32
             writer.write_u_int(32)
             writer.write_stream(data_writer.stream)
             data_writer.dispose()
@@ -494,7 +497,40 @@ class SerializedFile(File.File):
             writer.write_stream(meta_writer.stream)
             meta_writer.dispose()
 
+    def save(self, packer: Optional[str] = None) -> bytes:
+        meta_writer, data_writer = self._build_meta_and_data()
+        writer = EndianBinaryWriter()
+        self._assemble(writer, meta_writer, data_writer)
         return writer.bytes
+
+    def save_to(self, path: str, packer: Optional[str] = None) -> int:
+        """Save directly to a file, avoiding holding the full serialized
+        data in memory at once.  Returns the file size in bytes.
+
+        Object data is written to a temporary file instead of BytesIO,
+        so even multi-GB bundles only need a small amount of RAM.
+        """
+        import os
+        import tempfile
+
+        tmp_data_fd, tmp_data_path = tempfile.mkstemp()
+        try:
+            # Write object data to a temp file instead of BytesIO
+            tmp_data_file = os.fdopen(tmp_data_fd, "w+b")
+            file_backed_data_writer = EndianBinaryWriter(tmp_data_file, endian=self.header.endian)
+            meta_writer, data_writer = self._build_meta_and_data(data_writer=file_backed_data_writer)
+            # data_writer is the same object as file_backed_data_writer
+
+            with open(path, "wb") as out:
+                writer = EndianBinaryWriter(out, endian=self.header.endian)
+                self._assemble(writer, meta_writer, data_writer)
+            # _assemble already disposed data_writer (closes the temp file)
+        finally:
+            try:
+                os.remove(tmp_data_path)
+            except OSError:
+                pass
+        return os.path.getsize(path)
 
 
 def read_string(string_buffer_reader: EndianBinaryReader, value: int) -> str:
