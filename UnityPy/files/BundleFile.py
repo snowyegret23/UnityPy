@@ -1,6 +1,9 @@
 # TODO: implement encryption for saving files
+import io
+import mmap
 import os
 import re
+import tempfile
 from collections import namedtuple
 from typing import Optional, Union, cast
 
@@ -10,6 +13,7 @@ from ..helpers import ArchiveStorageManager, CompressionHelper
 from ..helpers.UnityVersion import UnityVersion
 from ..streams import EndianBinaryReader, EndianBinaryWriter
 from . import File
+from .replacers import BytesReplacer, Replacer, SourceSliceReplacer, TempFileReplacer
 
 BlockInfo = namedtuple("BlockInfo", "uncompressedSize compressedSize flags")
 DirectoryInfoFS = namedtuple("DirectoryInfoFS", "offset size flags path")
@@ -25,6 +29,11 @@ class BundleFile(File.File):
     dataflags: Union[ArchiveFlags, ArchiveFlagsOld]
     decryptor: Optional[ArchiveStorageManager.ArchiveStorageDecryptor] = None
     _uses_block_alignment: bool = False
+    _blocks_tmp_path: Optional[str] = None
+    _blocks_tmp_file = None
+    _blocks_mmap = None
+    _blocks_reader: Optional[EndianBinaryReader] = None
+    _directory_info_map: dict[str, DirectoryInfoFS]
 
     def __init__(
         self,
@@ -51,7 +60,84 @@ class BundleFile(File.File):
         else:
             raise NotImplementedError(f"Unknown Bundle signature: {signature}")
 
+        self._blocks_reader = blocksReader
+        self._directory_info_map = {info.path: info for info in m_DirectoryInfo}
         self.read_files(blocksReader, m_DirectoryInfo)
+
+    def _cleanup_temp_blocks_storage(self):
+        mmap_obj = getattr(self, "_blocks_mmap", None)
+        file_obj = getattr(self, "_blocks_tmp_file", None)
+        tmp_path = getattr(self, "_blocks_tmp_path", None)
+
+        self._blocks_reader = None
+        self._blocks_mmap = None
+        self._blocks_tmp_file = None
+        self._blocks_tmp_path = None
+
+        if mmap_obj is not None:
+            try:
+                mmap_obj.close()
+            except (BufferError, OSError, ValueError):
+                pass
+
+        if file_obj is not None:
+            try:
+                file_obj.close()
+            except OSError:
+                pass
+
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    def __del__(self):
+        self._cleanup_temp_blocks_storage()
+
+    def _create_temp_backed_blocks_reader(
+        self,
+        reader: EndianBinaryReader,
+        blocks_info: list[BlockInfo],
+        *,
+        offset: int,
+    ):
+        self._cleanup_temp_blocks_storage()
+
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix="UnityPy_bundle_blocks_", suffix=".tmp")
+        tmp_file = os.fdopen(tmp_fd, "w+b")
+        try:
+            for index, block_info in enumerate(blocks_info):
+                decompressed_block = self.decompress_data(
+                    reader.read_bytes(block_info.compressedSize),
+                    block_info.uncompressedSize,
+                    block_info.flags,
+                    index,
+                )
+                if decompressed_block:
+                    tmp_file.write(decompressed_block)
+            tmp_file.flush()
+            tmp_file.seek(0)
+            if tmp_file.seek(0, os.SEEK_END) == 0:
+                tmp_file.close()
+                os.remove(tmp_path)
+                return EndianBinaryReader(b"", offset=offset)
+            tmp_file.seek(0)
+            mmap_obj = mmap.mmap(tmp_file.fileno(), 0, access=mmap.ACCESS_READ)
+        except Exception:
+            try:
+                tmp_file.close()
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            raise
+
+        self._blocks_tmp_path = tmp_path
+        self._blocks_tmp_file = tmp_file
+        self._blocks_mmap = mmap_obj
+        return EndianBinaryReader(memoryview(mmap_obj), offset=offset)
 
     def read_web_raw(self, reader: EndianBinaryReader):
         # def read_header_and_blocks_info(self, reader:EndianBinaryReader):
@@ -171,16 +257,9 @@ class BundleFile(File.File):
         if isinstance(self.dataflags, ArchiveFlags) and self.dataflags & ArchiveFlags.BlockInfoNeedPaddingAtStart:
             reader.align_stream(16)
 
-        blocksReader = EndianBinaryReader(
-            b"".join(
-                self.decompress_data(
-                    reader.read_bytes(blockInfo.compressedSize),
-                    blockInfo.uncompressedSize,
-                    blockInfo.flags,
-                    i,
-                )
-                for i, blockInfo in enumerate(m_BlocksInfo)
-            ),
+        blocksReader = self._create_temp_backed_blocks_reader(
+            reader,
+            m_BlocksInfo,
             offset=(blocksInfoReader.real_offset()),
         )
 
@@ -276,45 +355,59 @@ class BundleFile(File.File):
         return os.path.getsize(path)
 
     def save_fs(self, writer: EndianBinaryWriter, data_flag: int, block_info_flag: int):
-        import io
-        import tempfile
-
         # Detect whether the writer is backed by a real file (save_to)
         # or an in-memory BytesIO (save).  When file-backed we can use
         # temp files to avoid holding multi-GB compressed payloads in RAM.
         is_file_backed = not isinstance(writer.stream, io.BytesIO)
 
         files = []
+        temp_replacers: list[TempFileReplacer] = []
+
+        def iter_replacer_chunks(replacer: Replacer, chunk_size: int = 1048576):
+            yield from replacer.iter_chunks(chunk_size)
+
+        def build_replacer(name: str, f) -> Replacer:
+            original_info = self._directory_info_map.get(name)
+            if (
+                original_info is not None
+                and self._blocks_reader is not None
+                and not getattr(f, "is_changed", False)
+            ):
+                return SourceSliceReplacer.from_reader(
+                    self._blocks_reader,
+                    int(original_info.offset),
+                    int(original_info.size),
+                )
+
+            if isinstance(f, EndianBinaryReader):
+                return SourceSliceReplacer.from_reader(f, 0, f.Length)
+
+            if isinstance(f, EndianBinaryWriter):
+                return SourceSliceReplacer.from_writer(f)
+
+            if is_file_backed and hasattr(f, "save_to"):
+                tmp_fd, tmp_path = tempfile.mkstemp(prefix="unitypy_bundle_entry_", suffix=".bin")
+                os.close(tmp_fd)
+                f.save_to(tmp_path)
+                replacer = TempFileReplacer(
+                    tmp_path,
+                    os.path.getsize(tmp_path),
+                    delete_on_cleanup=True,
+                )
+                temp_replacers.append(replacer)
+                return replacer
+
+            return BytesReplacer(f.save())
+
+        file_entries: list[tuple[str, int, Replacer]] = []
+        for name, f in self.files.items():
+            replacer = build_replacer(name, f)
+            file_entries.append((name, getattr(f, "flags", 0), replacer))
+            files.append((name, getattr(f, "flags", 0), len(replacer)))
 
         def iter_file_data():
-            for name, f in self.files.items():
-                if isinstance(f, (EndianBinaryReader, EndianBinaryWriter)):
-                    file_data = f.bytes
-                elif is_file_backed and hasattr(f, "save_to"):
-                    # Stream large SerializedFile data through a temp file
-                    # so we never hold the full blob in memory.
-                    tmp_fd, tmp_path = tempfile.mkstemp()
-                    os.close(tmp_fd)
-                    try:
-                        f.save_to(tmp_path)
-                        file_size = os.path.getsize(tmp_path)
-                        files.append((name, f.flags, file_size))
-                        with open(tmp_path, "rb") as tmp_in:
-                            while True:
-                                chunk = tmp_in.read(1048576)
-                                if not chunk:
-                                    break
-                                yield chunk
-                    finally:
-                        try:
-                            os.remove(tmp_path)
-                        except OSError:
-                            pass
-                    continue
-                else:
-                    file_data = f.save()
-                files.append((name, f.flags, len(file_data)))
-                yield file_data
+            for _name, _flags, replacer in file_entries:
+                yield from iter_replacer_chunks(replacer)
 
         # remove encryption flag, as encryption is not applied by UnityPy during save
         if block_info_flag & self.dataflags.UsesAssetBundleEncryption:
@@ -420,6 +513,8 @@ class BundleFile(File.File):
             writer.write_long(writer_end_pos)
             writer.Position = writer_end_pos
         finally:
+            for replacer in temp_replacers:
+                replacer.cleanup()
             if compressed_tmp_path:
                 try:
                     os.remove(compressed_tmp_path)

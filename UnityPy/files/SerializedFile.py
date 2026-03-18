@@ -13,6 +13,7 @@ from ..helpers.UnityVersion import UnityVersion
 from ..streams import EndianBinaryWriter
 from . import BundleFile, File
 from .ObjectReader import ObjectReader
+from .replacers import AppendOnlySpillStore
 
 if TYPE_CHECKING:
     from ..classes import AssetBundle, Object
@@ -221,6 +222,7 @@ class SerializedFile(File.File):
     userInformation: Optional[str]
     assetbundle: Optional[AssetBundle]
     _cache: Dict[str, Object]
+    _spill_store: Optional[AppendOnlySpillStore]
 
     @property
     def files(self):
@@ -249,6 +251,7 @@ class SerializedFile(File.File):
         # used by: Sprite (Texture2D (with alpha) cached),
         self._cache = {}
         self.unknown = 0
+        self._spill_store = None
 
         # ReadHeader
         header = SerializedFileHeader(reader)
@@ -326,6 +329,21 @@ class SerializedFile(File.File):
     @property
     def container(self):
         return self._container
+
+    def get_spill_store(self) -> AppendOnlySpillStore:
+        if self._spill_store is None:
+            self._spill_store = AppendOnlySpillStore(
+                prefix=f"unitypy_{self.name or 'asset'}_spill_",
+            )
+        return self._spill_store
+
+    def close(self) -> None:
+        if self._spill_store is not None:
+            self._spill_store.close()
+            self._spill_store = None
+
+    def __del__(self):
+        self.close()
 
     def load_dependencies(self, possible_dependencies: Optional[list] = None):
         """Load all external dependencies.

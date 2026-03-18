@@ -23,12 +23,14 @@ from ..helpers import TypeTreeHelper
 from ..helpers.Tpk import get_typetree_node
 from ..helpers.TypeTreeNode import TypeTreeNode
 from ..streams import EndianBinaryReader, EndianBinaryWriter
+from .replacers import Replacer, SourceSliceReplacer
 
 if TYPE_CHECKING:
     from ..files.SerializedFile import SerializedFile, SerializedType
 
 T = TypeVar("T")
 NodeInput = Union[TypeTreeNode, List[Dict[str, Union[str, int]]]]
+_SPILL_RAW_DATA_THRESHOLD = 8 * 1024 * 1024
 
 
 @define(
@@ -46,7 +48,7 @@ class ObjectReader(Generic[T]):
     byte_size: int
     is_destroyed: Optional[int]
     is_stripped: Optional[int]
-    data: Optional[bytes] = None
+    data: Optional[Union[bytes, bytearray, memoryview, Replacer]] = None
     _read_until: Optional[int] = None
 
     @property
@@ -150,16 +152,23 @@ class ObjectReader(Generic[T]):
             #         self.reader.Position = self._read_until
             #         data += self.reader.read_bytes(end_pos - self._read_until)
         else:
-            self.reset()
-            data = self.reader.read(self.byte_size)
+            data = SourceSliceReplacer.from_reader(
+                self.reader,
+                self.byte_start,
+                self.byte_size,
+            )
 
         if header.version >= 22:
             writer.write_long(data_writer.Position)
         else:
             writer.write_u_int(data_writer.Position)
 
-        writer.write_u_int(len(data))
-        data_writer.write(data)
+        data_size = len(data)
+        writer.write_u_int(data_size)
+        if isinstance(data, Replacer):
+            data.write_to(data_writer)
+        else:
+            data_writer.write(data)
 
         writer.write_int(self.type_id)
 
@@ -178,10 +187,13 @@ class ObjectReader(Generic[T]):
             assert self.is_stripped is not None
             writer.write_byte(self.is_stripped)
 
-    def set_raw_data(self, data: bytes):
+    def set_raw_data(self, data: Optional[Union[bytes, bytearray, memoryview, Replacer]]):
+        previous = self.data
         self.data = data
         if self.assets_file:
             self.assets_file.mark_changed()
+        if isinstance(previous, Replacer) and previous is not data:
+            previous.cleanup()
 
     def get_class(self) -> Union[Type[T], None]:
         return ClassIDTypeToClassMap.get(self.type)  # type: ignore
@@ -265,14 +277,39 @@ class ObjectReader(Generic[T]):
         writer: Optional[EndianBinaryWriter] = None,
     ):
         node = self._get_typetree_node(nodes)
-        if not writer:
-            writer = EndianBinaryWriter(endian=self.reader.endian)
-        TypeTreeHelper.write_typetree(tree, node, writer, self.assets_file)
-        data = writer.bytes
-        self.set_raw_data(data)
-        return data
+        owns_writer = writer is None
+        spill_to_file = owns_writer and int(self.byte_size or 0) >= _SPILL_RAW_DATA_THRESHOLD
+        spill_segment = None
+        try:
+            if not writer:
+                if spill_to_file:
+                    spill_store = self.assets_file.get_spill_store()
+                    writer, spill_segment = spill_store.create_writer(
+                        endian=self.reader.endian
+                    )
+                else:
+                    writer = EndianBinaryWriter(endian=self.reader.endian)
+            TypeTreeHelper.write_typetree(tree, node, writer, self.assets_file)
+            if spill_to_file:
+                assert spill_segment is not None
+                spilled = self.assets_file.get_spill_store().slice(
+                    spill_segment.start,
+                    spill_segment.length,
+                )
+                writer.dispose()
+                writer = None
+                self.set_raw_data(spilled)
+                return spilled
+            data = writer.bytes
+            self.set_raw_data(data)
+            return data
+        finally:
+            if writer is not None and owns_writer:
+                writer.dispose()
 
     def get_raw_data(self) -> bytes:
+        if isinstance(self.data, Replacer):
+            return self.data.read_bytes()
         pos = self.Position
         self.reset()
         ret = self.reader.read_bytes(self.byte_size)
