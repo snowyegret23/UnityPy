@@ -1,10 +1,11 @@
 # 변경사항 정리 (기준 커밋: `2c1156115c1ad635c2211a743029e5bd1804c76d` 이후 ~ 현재 `HEAD`)
 
-## 대상 커밋 (총 4개)
+## 대상 커밋 (총 5개)
 1. `1964d74881da3a766530e5a784f69c3241f42293` - Reduce UnityFS memory spikes by removing large temporary copies
 2. `049a6fed9601c60075e1ff1099d14151c2712b10` - Reduce save memory usage with streaming writes and save_to()
 3. `5912f4cb5984061737ea667a98274e4902cf55b6` - file based
 4. `5365b7a4f47bce809b28c098104528162ab51b15` - fix endian
+5. `54f9ca2dc3b44dda828635f3d4750d1a679e16f7` - Reuse source slices and spill large payloads to disk during bundle saves
 
 ## 변경 포인트 1: `File.read_files`에서 노드 데이터 복사 최소화
 - 파일: `UnityPy/files/File.py`
@@ -209,7 +210,7 @@ with open(path, "wb") as out:
 5. `UnityPy/files/File.py`
    - memory reader 분기(`reader.view` slice) 반영 확인
 
-## 현재 워킹트리 추가 변경사항 (미커밋)
+## 추가 변경사항 (`54f9ca2dc3b44dda828635f3d4750d1a679e16f7`)
 
 ### 변경 포인트 7: UnityFS 블록 전체를 메모리에 합치지 않고 temp file + `mmap`으로 유지
 - 파일: `UnityPy/files/BundleFile.py`
