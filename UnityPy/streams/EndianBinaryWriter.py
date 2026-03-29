@@ -6,6 +6,9 @@ from typing import Callable, Sequence, TypeVar, Union
 T = TypeVar("T")
 
 
+_ALIGN_PADDING = tuple(b"\0" * i for i in range(17))
+
+
 class EndianBinaryWriter:
     endian: str
     Position: int
@@ -107,7 +110,8 @@ class EndianBinaryWriter:
     def align_stream(self, alignment: int = 4):
         pos = self.stream.tell()
         align = (alignment - pos % alignment) % alignment
-        self.write(b"\0" * align)
+        if align > 0:
+            self.write(_ALIGN_PADDING[align] if align < len(_ALIGN_PADDING) else b"\0" * align)
 
     def write_array(
         self,

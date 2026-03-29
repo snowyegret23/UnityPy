@@ -29,6 +29,7 @@ class BundleFile(File.File):
     dataflags: Union[ArchiveFlags, ArchiveFlagsOld]
     decryptor: Optional[ArchiveStorageManager.ArchiveStorageDecryptor] = None
     _uses_block_alignment: bool = False
+    _block_info_flags: int = 0
     _blocks_tmp_path: Optional[str] = None
     _blocks_tmp_file = None
     _blocks_mmap = None
@@ -114,7 +115,7 @@ class BundleFile(File.File):
                     block_info.flags,
                     index,
                 )
-                if decompressed_block:
+                if decompressed_block is not None:
                     tmp_file.write(decompressed_block)
             tmp_file.flush()
             tmp_file.seek(0)
@@ -265,30 +266,15 @@ class BundleFile(File.File):
 
         return m_DirectoryInfo, blocksReader
 
-    def save(self, packer=None):
-        """
-        Rewrites the BundleFile and returns it as bytes object.
-
-        packer:
-            can be either one of the following strings
-            or tuple consisting of (block_info_flag, data_flag)
-            allowed strings:
-                none - no compression, default, safest bet
-                lz4 - lz4 compression
-                original - uses the original flags
-        """
-        # file_header
-        #     signature         (string_to_null)
-        #     format            (int)
-        #     version_player    (string_to_null)
-        #     version_engine    (string_to_null)
-        writer = EndianBinaryWriter()
-
+    def _write_header(self, writer: EndianBinaryWriter):
+        """Write the common bundle file header fields."""
         writer.write_string_to_null(self.signature)
         writer.write_u_int(self.version)
         writer.write_string_to_null(self.version_player)
         writer.write_string_to_null(self.version_engine)
 
+    def _dispatch_save(self, writer: EndianBinaryWriter, packer=None):
+        """Dispatch save to the correct format handler based on signature and packer."""
         if self.signature == "UnityArchive":
             raise NotImplementedError("BundleFile - UnityArchive")
         elif self.signature in ["UnityWeb", "UnityRaw"]:
@@ -313,6 +299,22 @@ class BundleFile(File.File):
                 self.save_fs(writer, *packer)
             else:
                 raise NotImplementedError("UnityFS - Packer:", packer)
+
+    def save(self, packer=None):
+        """
+        Rewrites the BundleFile and returns it as bytes object.
+
+        packer:
+            can be either one of the following strings
+            or tuple consisting of (block_info_flag, data_flag)
+            allowed strings:
+                none - no compression, default, safest bet
+                lz4 - lz4 compression
+                original - uses the original flags
+        """
+        writer = EndianBinaryWriter()
+        self._write_header(writer)
+        self._dispatch_save(writer, packer)
         return writer.bytes
 
     def save_to(self, path, packer=None):
@@ -324,33 +326,8 @@ class BundleFile(File.File):
         """
         with open(path, "wb") as f:
             writer = EndianBinaryWriter(f)
-
-            writer.write_string_to_null(self.signature)
-            writer.write_u_int(self.version)
-            writer.write_string_to_null(self.version_player)
-            writer.write_string_to_null(self.version_engine)
-
-            if self.signature == "UnityArchive":
-                raise NotImplementedError("BundleFile - UnityArchive")
-            elif self.signature in ["UnityWeb", "UnityRaw"]:
-                self.save_web_raw(writer)
-            elif self.signature == "UnityFS":
-                if not packer or packer == "none":
-                    self.save_fs(writer, 64, 64)
-                elif packer == "original":
-                    self.save_fs(
-                        writer,
-                        data_flag=self.dataflags,
-                        block_info_flag=self._block_info_flags,
-                    )
-                elif packer == "lz4":
-                    self.save_fs(writer, data_flag=194, block_info_flag=2)
-                elif packer == "lzma":
-                    self.save_fs(writer, data_flag=65, block_info_flag=1)
-                elif isinstance(packer, tuple):
-                    self.save_fs(writer, *packer)
-                else:
-                    raise NotImplementedError("UnityFS - Packer:", packer)
+            self._write_header(writer)
+            self._dispatch_save(writer, packer)
 
         return os.path.getsize(path)
 
@@ -362,9 +339,6 @@ class BundleFile(File.File):
 
         files = []
         temp_replacers: list[TempFileReplacer] = []
-
-        def iter_replacer_chunks(replacer: Replacer, chunk_size: int = 1048576):
-            yield from replacer.iter_chunks(chunk_size)
 
         def build_replacer(name: str, f) -> Replacer:
             original_info = self._directory_info_map.get(name)
@@ -407,7 +381,7 @@ class BundleFile(File.File):
 
         def iter_file_data():
             for _name, _flags, replacer in file_entries:
-                yield from iter_replacer_chunks(replacer)
+                yield from replacer.iter_chunks()
 
         # remove encryption flag, as encryption is not applied by UnityPy during save
         if block_info_flag & self.dataflags.UsesAssetBundleEncryption:
@@ -572,7 +546,9 @@ class BundleFile(File.File):
 
         directory_info_writer.write(b"\x00" * file_info_header_padding_size)
         uncompressed_directory_info = directory_info_writer.bytes
+        directory_info_writer.dispose()
         uncompressed_file_content = file_content_writer.bytes
+        file_content_writer.dispose()
 
         # Combine directory info and file content
         uncompressed_content = uncompressed_directory_info + uncompressed_file_content

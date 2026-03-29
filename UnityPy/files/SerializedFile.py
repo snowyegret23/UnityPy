@@ -519,7 +519,9 @@ class SerializedFile(File.File):
         meta_writer, data_writer = self._build_meta_and_data()
         writer = EndianBinaryWriter()
         self._assemble(writer, meta_writer, data_writer)
-        return writer.bytes
+        result = writer.bytes
+        writer.dispose()
+        return result
 
     def save_to(self, path: str, packer: Optional[str] = None) -> int:
         """Save directly to a file, avoiding holding the full serialized
@@ -532,6 +534,7 @@ class SerializedFile(File.File):
         import tempfile
 
         tmp_data_fd, tmp_data_path = tempfile.mkstemp()
+        file_backed_data_writer = None
         try:
             # Write object data to a temp file instead of BytesIO
             tmp_data_file = os.fdopen(tmp_data_fd, "w+b")
@@ -545,7 +548,14 @@ class SerializedFile(File.File):
                 writer = EndianBinaryWriter(out)
                 self._assemble(writer, meta_writer, data_writer)
             # _assemble already disposed data_writer (closes the temp file)
+            file_backed_data_writer = None
         finally:
+            # Ensure the temp file handle is closed even if _assemble raised
+            if file_backed_data_writer is not None:
+                try:
+                    file_backed_data_writer.dispose()
+                except OSError:
+                    pass
             try:
                 os.remove(tmp_data_path)
             except OSError:

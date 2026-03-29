@@ -27,7 +27,7 @@ class BytesReplacer:
     __slots__ = ("data", "size")
 
     def __init__(self, data: bytes | bytearray | memoryview):
-        self.data = bytes(data)
+        self.data = data if isinstance(data, bytes) else bytes(data)
         self.size = len(self.data)
 
     def __len__(self) -> int:
@@ -249,12 +249,11 @@ class _AppendSegmentIO(IOBase):
     def write(self, b: bytes | bytearray | memoryview) -> int:
         if self._closed:
             raise ValueError("I/O operation on closed spill segment")
-        payload = bytes(b)
-        if not payload:
+        if not b:
             return 0
         stream = self._store._stream
         stream.seek(self._start + self._position)
-        written = stream.write(payload)
+        written = stream.write(b)
         self._position += written
         if self._position > self._length:
             self._length = self._position
@@ -335,7 +334,7 @@ class AppendOnlySpillStore:
     def append_bytes(self, data: bytes | bytearray | memoryview) -> SpillStoreSliceReplacer:
         writer, segment = self.create_writer()
         try:
-            writer.write(bytes(data))
+            writer.write(data)
         finally:
             writer.dispose()
         return self.slice(segment.start, segment.length)
