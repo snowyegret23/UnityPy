@@ -102,6 +102,44 @@ class ObjectReaderSpillTests(unittest.TestCase):
         self.assertEqual(payload, result)
         self.assertEqual(payload, obj_reader.data)
 
+    def test_save_typetree_spills_when_output_grows_past_threshold(self) -> None:
+        payload = b"C" * (_SPILL_RAW_DATA_THRESHOLD + 1)
+        obj_reader = self._make_reader(byte_size=1024)
+
+        with mock.patch.object(
+            ObjectReader,
+            "_get_typetree_node",
+            return_value=object(),
+        ), mock.patch(
+            "UnityPy.files.ObjectReader.TypeTreeHelper.write_typetree",
+            side_effect=lambda tree, node, writer, assets_file: writer.write(payload),
+        ):
+            result = obj_reader.save_typetree({"dummy": True})
+
+        self.assertIsInstance(result, SpillStoreSliceReplacer)
+        self.assertEqual(payload, obj_reader.get_raw_data())
+
+    def test_save_typetree_discards_partial_spill_after_write_failure(self) -> None:
+        obj_reader = self._make_reader(byte_size=_SPILL_RAW_DATA_THRESHOLD)
+
+        def fail_after_write(tree, node, writer, assets_file):
+            writer.write(b"partial")
+            raise RuntimeError("injected typetree write failure")
+
+        with mock.patch.object(
+            ObjectReader,
+            "_get_typetree_node",
+            return_value=object(),
+        ), mock.patch(
+            "UnityPy.files.ObjectReader.TypeTreeHelper.write_typetree",
+            side_effect=fail_after_write,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "injected typetree write failure"):
+                obj_reader.save_typetree({"dummy": True})
+
+        spill_store = obj_reader.assets_file.get_spill_store()
+        self.assertEqual(os.path.getsize(spill_store.path), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

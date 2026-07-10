@@ -1,4 +1,5 @@
 import io
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -13,6 +14,31 @@ from UnityPy.streams import EndianBinaryReader, EndianBinaryWriter
 
 
 class ReplacerTests(unittest.TestCase):
+    def test_writer_accepts_seekable_file_like_objects(self) -> None:
+        class FileLike:
+            def __init__(self):
+                self.buffer = io.BytesIO()
+
+            def read(self, *args):
+                return self.buffer.read(*args)
+
+            def write(self, *args):
+                return self.buffer.write(*args)
+
+            def seek(self, *args):
+                return self.buffer.seek(*args)
+
+            def tell(self):
+                return self.buffer.tell()
+
+            def close(self):
+                self.buffer.close()
+
+        writer = EndianBinaryWriter(FileLike())
+        writer.write(b"file-like")
+        self.assertEqual(writer.bytes, b"file-like")
+        writer.dispose()
+
     def test_source_slice_replacer_streams_from_reader_without_full_copy(self) -> None:
         reader = EndianBinaryReader(b"abcdefghijk")
         replacer = SourceSliceReplacer.from_reader(reader, 2, 5)
@@ -46,6 +72,49 @@ class ReplacerTests(unittest.TestCase):
         out = EndianBinaryWriter()
         replacer.write_to(out, chunk_size=4)
         self.assertEqual(b"segment-one", out.bytes)
+
+    def test_append_only_spill_store_retries_short_writes(self) -> None:
+        class ShortWriteStream:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def write(self, data):
+                return self.stream.write(data[:2])
+
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+
+        store = AppendOnlySpillStore(prefix="unitypy_test_short_write_")
+        self.addCleanup(store.close)
+        store._stream = ShortWriteStream(store._stream)
+
+        replacer = store.append_bytes(b"complete-segment")
+
+        self.assertEqual(replacer.read_bytes(), b"complete-segment")
+
+    def test_append_only_spill_store_discards_partial_failed_write(self) -> None:
+        class FailingStream:
+            def __init__(self, stream):
+                self.stream = stream
+                self.write_calls = 0
+
+            def write(self, data):
+                self.write_calls += 1
+                if self.write_calls == 1:
+                    return self.stream.write(data[:2])
+                raise OSError("injected spill write failure")
+
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+
+        store = AppendOnlySpillStore(prefix="unitypy_test_failed_write_")
+        self.addCleanup(store.close)
+        store._stream = FailingStream(store._stream)
+
+        with self.assertRaisesRegex(OSError, "injected spill write failure"):
+            store.append_bytes(b"partial-segment")
+
+        self.assertEqual(os.path.getsize(store.path), 0)
 
     def test_temp_file_replacer_deletes_owned_file(self) -> None:
         store = AppendOnlySpillStore(prefix="unitypy_test_replacer_tmp_")

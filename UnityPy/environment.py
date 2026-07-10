@@ -180,8 +180,12 @@ class Environment:
         """
         for fname, fitem in self.files.items():
             if getattr(fitem, "is_changed", False):
-                with open(self.fs.sep.join([out_path, ntpath.basename(fname)]), "wb") as out:
-                    out.write(fitem.save(packer=pack))
+                output_path = self.fs.sep.join([out_path, ntpath.basename(fname)])
+                if hasattr(fitem, "save_to"):
+                    fitem.save_to(output_path, packer=pack)
+                else:
+                    with open(output_path, "wb") as out:
+                        out.write(fitem.save(packer=pack))
 
     @property
     def objects(self) -> List[ObjectReader]:
@@ -210,7 +214,7 @@ class Environment:
             return
 
         self._container_index_built = True
-        for f in self.cabs.values():
+        for f in list(self.cabs.values()):
             if isinstance(f, SerializedFile):
                 f.container.parse_preload_table()
 

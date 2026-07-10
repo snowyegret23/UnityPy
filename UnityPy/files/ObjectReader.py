@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from tempfile import SpooledTemporaryFile
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -31,6 +32,22 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 NodeInput = Union[TypeTreeNode, List[Dict[str, Union[str, int]]]]
 _SPILL_RAW_DATA_THRESHOLD = 8 * 1024 * 1024
+
+
+class _ThresholdSpooledTemporaryFile(SpooledTemporaryFile):
+    def __init__(self, threshold: int):
+        super().__init__(max_size=threshold, mode="w+b")
+        self._threshold = threshold
+
+    def write(self, data):
+        if data and not getattr(self, "_rolled", False):
+            position = self.tell()
+            self.seek(0, 2)
+            current_size = self.tell()
+            self.seek(position)
+            if max(current_size, position + len(data)) >= self._threshold:
+                self.rollover()
+        return super().write(data)
 
 
 @define(
@@ -282,6 +299,7 @@ class ObjectReader(Generic[T]):
         node = self._get_typetree_node(nodes)
         owns_writer = writer is None
         spill_to_file = owns_writer and int(self.byte_size or 0) >= _SPILL_RAW_DATA_THRESHOLD
+        spill_store = None
         spill_segment = None
         try:
             if not writer:
@@ -291,7 +309,10 @@ class ObjectReader(Generic[T]):
                         endian=self.reader.endian
                     )
                 else:
-                    writer = EndianBinaryWriter(endian=self.reader.endian)
+                    writer = EndianBinaryWriter(
+                        _ThresholdSpooledTemporaryFile(_SPILL_RAW_DATA_THRESHOLD),
+                        endian=self.reader.endian,
+                    )
             TypeTreeHelper.write_typetree(tree, node, writer, self.assets_file)
             if spill_to_file:
                 assert spill_segment is not None
@@ -303,16 +324,54 @@ class ObjectReader(Generic[T]):
                 writer = None
                 self.set_raw_data(spilled)
                 return spilled
+            if owns_writer and writer.Length >= _SPILL_RAW_DATA_THRESHOLD:
+                spill_store = self.assets_file.get_spill_store()
+                spill_writer, spill_segment = spill_store.create_writer(
+                    endian=self.reader.endian
+                )
+                try:
+                    spill_writer.write_stream(writer.stream)
+                except BaseException:
+                    try:
+                        spill_writer.dispose()
+                    except BaseException:
+                        pass
+                    raise
+                else:
+                    spill_writer.dispose()
+                writer.dispose()
+                writer = None
+                spilled = spill_store.slice(
+                    spill_segment.start,
+                    spill_segment.length,
+                )
+                self.set_raw_data(spilled)
+                return spilled
             data = writer.bytes
             self.set_raw_data(data)
             return data
+        except BaseException:
+            if writer is not None and owns_writer:
+                try:
+                    writer.dispose()
+                except BaseException:
+                    pass
+                writer = None
+            if spill_store is not None and spill_segment is not None:
+                try:
+                    spill_store.discard_segment(spill_segment)
+                except OSError:
+                    pass
+            raise
         finally:
             if writer is not None and owns_writer:
                 writer.dispose()
 
     def get_raw_data(self) -> bytes:
-        if isinstance(self.data, Replacer):
-            return self.data.read_bytes()
+        if self.data is not None:
+            if isinstance(self.data, Replacer):
+                return self.data.read_bytes()
+            return self.data if isinstance(self.data, bytes) else bytes(self.data)
         pos = self.Position
         self.reset()
         ret = self.reader.read_bytes(self.byte_size)

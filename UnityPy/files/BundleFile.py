@@ -1,11 +1,14 @@
+from __future__ import annotations
+
 # TODO: implement encryption for saving files
 import io
 import mmap
 import os
 import re
 import tempfile
+import weakref
 from collections import namedtuple
-from typing import Optional, Union, cast
+from typing import BinaryIO, Optional, Union, cast
 
 from .. import config
 from ..enums import ArchiveFlags, ArchiveFlagsOld, CompressionFlags
@@ -35,6 +38,7 @@ class BundleFile(File.File):
     _blocks_mmap = None
     _blocks_reader: Optional[EndianBinaryReader] = None
     _directory_info_map: dict[str, DirectoryInfoFS]
+    _original_file_refs: dict[str, weakref.ReferenceType]
 
     def __init__(
         self,
@@ -64,6 +68,7 @@ class BundleFile(File.File):
         self._blocks_reader = blocksReader
         self._directory_info_map = {info.path: info for info in m_DirectoryInfo}
         self.read_files(blocksReader, m_DirectoryInfo)
+        self._original_file_refs = {name: weakref.ref(f) for name, f in self.files.items()}
 
     def _cleanup_temp_blocks_storage(self):
         mmap_obj = getattr(self, "_blocks_mmap", None)
@@ -96,6 +101,86 @@ class BundleFile(File.File):
     def __del__(self):
         self._cleanup_temp_blocks_storage()
 
+    @staticmethod
+    def _copy_reader_data(reader: EndianBinaryReader, size: int, output: BinaryIO) -> int:
+        remaining = int(size)
+        written = 0
+        while remaining > 0:
+            read_size = min(1024 * 1024, remaining)
+            data = reader.read_bytes(read_size)
+            if len(data) != read_size:
+                raise EOFError("Unexpected EOF while reading bundle block")
+            output.write(data)
+            remaining -= read_size
+            written += read_size
+        return written
+
+    def _write_decompressed_block(
+        self,
+        reader: EndianBinaryReader,
+        block_info: BlockInfo,
+        index: int,
+        output: BinaryIO,
+    ) -> None:
+        comp_flag = CompressionFlags(block_info.flags & ArchiveFlags.CompressionTypeMask)
+        if comp_flag == CompressionFlags.NONE:
+            self._copy_reader_data(reader, block_info.compressedSize, output)
+            return
+
+        is_encrypted = self.decryptor is not None and block_info.flags & 0x100
+        if comp_flag == CompressionFlags.LZMA and not is_encrypted:
+            compressed_size = int(block_info.compressedSize)
+            if compressed_size < 5:
+                raise ValueError("LZMA bundle block is missing its properties header")
+            properties = reader.read_bytes(5)
+            if len(properties) != 5:
+                raise EOFError("Unexpected EOF while reading LZMA properties")
+            decompressor = CompressionHelper.create_lzma_decompressor(properties)
+            remaining = compressed_size - 5
+            written = 0
+
+            while remaining > 0:
+                read_size = min(1024 * 1024, remaining)
+                compressed = reader.read_bytes(read_size)
+                if len(compressed) != read_size:
+                    raise EOFError("Unexpected EOF while reading LZMA bundle block")
+                remaining -= read_size
+
+                if decompressor.eof:
+                    continue
+
+                while True:
+                    max_length = min(
+                        1024 * 1024,
+                        int(block_info.uncompressedSize) - written + 1,
+                    )
+                    decompressed = decompressor.decompress(compressed, max_length=max_length)
+                    if decompressed:
+                        written += len(decompressed)
+                        if written > block_info.uncompressedSize:
+                            raise ValueError(
+                                f"LZMA bundle block exceeds its declared size of {block_info.uncompressedSize}"
+                            )
+                        output.write(decompressed)
+                    compressed = b""
+                    if decompressor.eof or decompressor.needs_input:
+                        break
+
+            if written != block_info.uncompressedSize:
+                raise ValueError(
+                    f"LZMA bundle block size mismatch: expected {block_info.uncompressedSize}, got {written}"
+                )
+            return
+
+        decompressed_block = self.decompress_data(
+            reader.read_bytes(block_info.compressedSize),
+            block_info.uncompressedSize,
+            block_info.flags,
+            index,
+        )
+        if decompressed_block is not None:
+            output.write(decompressed_block)
+
     def _create_temp_backed_blocks_reader(
         self,
         reader: EndianBinaryReader,
@@ -105,23 +190,20 @@ class BundleFile(File.File):
     ):
         self._cleanup_temp_blocks_storage()
 
-        tmp_fd, tmp_path = tempfile.mkstemp(prefix="UnityPy_bundle_blocks_", suffix=".tmp")
-        tmp_file = os.fdopen(tmp_fd, "w+b")
+        tmp_file = tempfile.NamedTemporaryFile(
+            mode="w+b",
+            prefix="UnityPy_bundle_blocks_",
+            suffix=".tmp",
+            delete=True,
+        )
+        tmp_path = tmp_file.name
         try:
             for index, block_info in enumerate(blocks_info):
-                decompressed_block = self.decompress_data(
-                    reader.read_bytes(block_info.compressedSize),
-                    block_info.uncompressedSize,
-                    block_info.flags,
-                    index,
-                )
-                if decompressed_block is not None:
-                    tmp_file.write(decompressed_block)
+                self._write_decompressed_block(reader, block_info, index, tmp_file)
             tmp_file.flush()
             tmp_file.seek(0)
             if tmp_file.seek(0, os.SEEK_END) == 0:
                 tmp_file.close()
-                os.remove(tmp_path)
                 return EndianBinaryReader(b"", offset=offset)
             tmp_file.seek(0)
             mmap_obj = mmap.mmap(tmp_file.fileno(), 0, access=mmap.ACCESS_READ)
@@ -337,14 +419,33 @@ class BundleFile(File.File):
         # temp files to avoid holding multi-GB compressed payloads in RAM.
         is_file_backed = not isinstance(writer.stream, io.BytesIO)
 
+        # remove encryption flag, as encryption is not applied by UnityPy during save
+        if block_info_flag & self.dataflags.UsesAssetBundleEncryption:
+            block_info_flag ^= self.dataflags.UsesAssetBundleEncryption
+        if data_flag & self.dataflags.UsesAssetBundleEncryption:
+            data_flag ^= self.dataflags.UsesAssetBundleEncryption
+
         files = []
         temp_replacers: list[TempFileReplacer] = []
+        compressed_tmp_path = None
+
+        def cleanup_temp_files():
+            for replacer in temp_replacers:
+                replacer.cleanup()
+            if compressed_tmp_path:
+                try:
+                    os.remove(compressed_tmp_path)
+                except OSError:
+                    pass
 
         def build_replacer(name: str, f) -> Replacer:
             original_info = self._directory_info_map.get(name)
+            original_ref = getattr(self, "_original_file_refs", {}).get(name)
             if (
                 original_info is not None
                 and self._blocks_reader is not None
+                and original_ref is not None
+                and f is original_ref()
                 and not getattr(f, "is_changed", False)
             ):
                 return SourceSliceReplacer.from_reader(
@@ -362,48 +463,58 @@ class BundleFile(File.File):
             if is_file_backed and hasattr(f, "save_to"):
                 tmp_fd, tmp_path = tempfile.mkstemp(prefix="unitypy_bundle_entry_", suffix=".bin")
                 os.close(tmp_fd)
-                f.save_to(tmp_path)
-                replacer = TempFileReplacer(
-                    tmp_path,
-                    os.path.getsize(tmp_path),
-                    delete_on_cleanup=True,
-                )
+                try:
+                    f.save_to(tmp_path)
+                    replacer = TempFileReplacer(
+                        tmp_path,
+                        os.path.getsize(tmp_path),
+                        delete_on_cleanup=True,
+                    )
+                except BaseException:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                    raise
                 temp_replacers.append(replacer)
                 return replacer
 
             return BytesReplacer(f.save())
 
         file_entries: list[tuple[str, int, Replacer]] = []
-        for name, f in self.files.items():
-            replacer = build_replacer(name, f)
-            file_entries.append((name, getattr(f, "flags", 0), replacer))
-            files.append((name, getattr(f, "flags", 0), len(replacer)))
+        try:
+            for name, f in self.files.items():
+                replacer = build_replacer(name, f)
+                file_entries.append((name, getattr(f, "flags", 0), replacer))
+                files.append((name, getattr(f, "flags", 0), len(replacer)))
+        except BaseException:
+            cleanup_temp_files()
+            raise
 
         def iter_file_data():
             for _name, _flags, replacer in file_entries:
                 yield from replacer.iter_chunks()
 
-        # remove encryption flag, as encryption is not applied by UnityPy during save
-        if block_info_flag & self.dataflags.UsesAssetBundleEncryption:
-            block_info_flag ^= self.dataflags.UsesAssetBundleEncryption
-        if data_flag & self.dataflags.UsesAssetBundleEncryption:
-            data_flag ^= self.dataflags.UsesAssetBundleEncryption
-
         # Compress file payloads.  When file-backed, write compressed
         # output to a temp file to avoid a huge in-memory bytearray.
-        compressed_tmp_path = None
-        if is_file_backed:
-            _cfd, compressed_tmp_path = tempfile.mkstemp()
-            os.close(_cfd)
-            block_info = CompressionHelper.chunk_based_compress_iter_to_file(
-                iter_file_data(), block_info_flag, compressed_tmp_path
-            )
-            compressed_data_size = os.path.getsize(compressed_tmp_path)
-        else:
-            file_data, block_info = CompressionHelper.chunk_based_compress_iter(
-                iter_file_data(), block_info_flag
-            )
-            compressed_data_size = len(file_data)
+        file_data_chunks = iter_file_data()
+        try:
+            try:
+                if is_file_backed:
+                    _cfd, compressed_tmp_path = tempfile.mkstemp()
+                    os.close(_cfd)
+                    block_info = CompressionHelper.chunk_based_compress_iter_to_file(
+                        file_data_chunks, block_info_flag, compressed_tmp_path
+                    )
+                else:
+                    file_data, block_info = CompressionHelper.chunk_based_compress_iter(
+                        file_data_chunks, block_info_flag
+                    )
+            finally:
+                file_data_chunks.close()
+        except BaseException:
+            cleanup_temp_files()
+            raise
 
         try:
             # write the block_info
@@ -487,13 +598,7 @@ class BundleFile(File.File):
             writer.write_long(writer_end_pos)
             writer.Position = writer_end_pos
         finally:
-            for replacer in temp_replacers:
-                replacer.cleanup()
-            if compressed_tmp_path:
-                try:
-                    os.remove(compressed_tmp_path)
-                except OSError:
-                    pass
+            cleanup_temp_files()
 
     def save_web_raw(self, writer: EndianBinaryWriter):
         # (version >= 4) hash

@@ -1,6 +1,7 @@
 import gzip
 import lzma
 import struct
+import tempfile
 from typing import Callable, Dict, Iterable, Tuple, Union
 
 import brotli
@@ -11,6 +12,46 @@ from ..enums.BundleFile import CompressionFlags
 ByteString = Union[bytes, bytearray, memoryview]
 GZIP_MAGIC: bytes = b"\x1f\x8b"
 BROTLI_MAGIC: bytes = b"brotli"
+LZMA_DICT_SIZE = 0x800000
+LZMA_PROPERTIES = 0x5D
+
+
+def create_lzma_decompressor(properties: ByteString) -> lzma.LZMADecompressor:
+    props, dict_size = struct.unpack("<BI", properties[:5])
+    lc = props % 9
+    remainder = props // 9
+    pb = remainder // 5
+    lp = remainder % 5
+    return lzma.LZMADecompressor(
+        format=lzma.FORMAT_RAW,
+        filters=[
+            {
+                "id": lzma.FILTER_LZMA1,
+                "dict_size": dict_size,
+                "lc": lc,
+                "lp": lp,
+                "pb": pb,
+            }
+        ],
+    )
+
+
+def create_lzma_compressor() -> lzma.LZMACompressor:
+    return lzma.LZMACompressor(
+        format=lzma.FORMAT_RAW,
+        filters=[
+            {
+                "id": lzma.FILTER_LZMA1,
+                "dict_size": LZMA_DICT_SIZE,
+                "lc": 3,
+                "lp": 0,
+                "pb": 2,
+                "mode": lzma.MODE_NORMAL,
+                "mf": lzma.MF_BT4,
+                "nice_len": 123,
+            }
+        ],
+    )
 
 
 # LZMA
@@ -23,23 +64,7 @@ def decompress_lzma(data: ByteString, read_decompressed_size: bool = False) -> b
     :return: uncompressed data
     :rtype: bytes
     """
-    props, dict_size = struct.unpack("<BI", data[:5])
-    lc = props % 9
-    remainder = props // 9
-    pb = remainder // 5
-    lp = remainder % 5
-    dec = lzma.LZMADecompressor(
-        format=lzma.FORMAT_RAW,
-        filters=[
-            {
-                "id": lzma.FILTER_LZMA1,
-                "dict_size": dict_size,
-                "lc": lc,
-                "lp": lp,
-                "pb": pb,
-            }
-        ],
-    )
+    dec = create_lzma_decompressor(data)
     data_offset = 13 if read_decompressed_size else 5
     return dec.decompress(data[data_offset:])
 
@@ -54,29 +79,14 @@ def compress_lzma(data: ByteString, write_decompressed_size: bool = False) -> by
     :return: compressed data
     :rtype: bytes
     """
-    dict_size = 0x800000  # 1 << 23
-    compressor = lzma.LZMACompressor(
-        format=lzma.FORMAT_RAW,
-        filters=[
-            {
-                "id": lzma.FILTER_LZMA1,
-                "dict_size": dict_size,
-                "lc": 3,
-                "lp": 0,
-                "pb": 2,
-                "mode": lzma.MODE_NORMAL,
-                "mf": lzma.MF_BT4,
-                "nice_len": 123,
-            }
-        ],
-    )
+    compressor = create_lzma_compressor()
 
     compressed_data = compressor.compress(data) + compressor.flush()
     cdl = len(compressed_data)
     if write_decompressed_size:
-        return struct.pack(f"<BIQ{cdl}s", 0x5D, dict_size, len(data), compressed_data)
+        return struct.pack(f"<BIQ{cdl}s", LZMA_PROPERTIES, LZMA_DICT_SIZE, len(data), compressed_data)
     else:
-        return struct.pack(f"<BI{cdl}s", 0x5D, dict_size, compressed_data)
+        return struct.pack(f"<BI{cdl}s", LZMA_PROPERTIES, LZMA_DICT_SIZE, compressed_data)
 
 
 # LZ4
@@ -302,6 +312,81 @@ def chunk_based_compress_iter(chunks: Iterable[ByteString], block_info_flag: int
 
     return compressed_file_data, block_info
 
+
+def _compress_lzma_iter_to_file(chunks: Iterable[ByteString], block_info_flag: int, out) -> list:
+    block_size_limit = COMPRESSION_CHUNK_SIZE_MAP[CompressionFlags.LZMA]
+    header = struct.pack("<BI", LZMA_PROPERTIES, LZMA_DICT_SIZE)
+    block_info = []
+
+    with tempfile.TemporaryFile() as raw_block:
+        compressor = None
+        block_start = 0
+        uncompressed_size = 0
+
+        def start_block():
+            nonlocal compressor, block_start, uncompressed_size
+            raw_block.seek(0)
+            raw_block.truncate()
+            block_start = out.tell()
+            out.write(header)
+            compressor = create_lzma_compressor()
+            uncompressed_size = 0
+
+        def finish_block():
+            nonlocal compressor, uncompressed_size
+            assert compressor is not None
+            out.write(compressor.flush())
+            compressed_size = out.tell() - block_start
+            if compressed_size > uncompressed_size:
+                out.seek(block_start)
+                out.truncate()
+                raw_block.seek(0)
+                while True:
+                    data = raw_block.read(1024 * 1024)
+                    if not data:
+                        break
+                    out.write(data)
+                block_info.append(
+                    (
+                        uncompressed_size,
+                        uncompressed_size,
+                        block_info_flag ^ int(CompressionFlags.LZMA),
+                    )
+                )
+            else:
+                block_info.append((uncompressed_size, compressed_size, block_info_flag))
+            compressor = None
+            uncompressed_size = 0
+
+        for chunk in chunks:
+            if not chunk:
+                continue
+            view = memoryview(chunk)
+            position = 0
+            while position < len(view):
+                if compressor is None:
+                    start_block()
+                copy_size = min(
+                    block_size_limit - uncompressed_size,
+                    len(view) - position,
+                    1024 * 1024,
+                )
+                piece = view[position : position + copy_size]
+                raw_block.write(piece)
+                compressed = compressor.compress(piece)
+                if compressed:
+                    out.write(compressed)
+                position += copy_size
+                uncompressed_size += copy_size
+                if uncompressed_size == block_size_limit:
+                    finish_block()
+
+        if compressor is not None:
+            finish_block()
+
+    return block_info
+
+
 def chunk_based_compress_iter_to_file(
     chunks: Iterable[ByteString], block_info_flag: int, out_path: str
 ) -> list:
@@ -310,8 +395,6 @@ def chunk_based_compress_iter_to_file(
 
     Returns *block_info* list only.  The compressed payload is on disk.
     """
-    import os
-
     switch = block_info_flag & 0x3F
 
     with open(out_path, "wb") as out:
@@ -323,6 +406,9 @@ def chunk_based_compress_iter_to_file(
                 out.write(chunk)
                 total_size += len(chunk)
             return [(total_size, total_size, block_info_flag)]
+
+        if switch == CompressionFlags.LZMA:
+            return _compress_lzma_iter_to_file(chunks, block_info_flag, out)
 
         if switch in COMPRESSION_MAP:
             compress_func = COMPRESSION_MAP[switch]
@@ -407,6 +493,8 @@ __all__ = (
     "compress_gzip",
     "compress_lz4",
     "compress_lzma",
+    "create_lzma_compressor",
+    "create_lzma_decompressor",
     "decompress_brotli",
     "decompress_gzip",
     "decompress_lz4",

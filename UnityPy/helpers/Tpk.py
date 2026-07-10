@@ -30,7 +30,8 @@ def init():
     else:
         from importlib.resources import open_binary
 
-        tpk_data = open_binary(package, resource).read()
+        with open_binary(package, resource) as stream:
+            tpk_data = stream.read()
 
     global TPKTYPETREE
     with BytesIO(tpk_data) as stream:

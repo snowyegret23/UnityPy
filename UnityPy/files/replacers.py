@@ -253,11 +253,17 @@ class _AppendSegmentIO(IOBase):
             return 0
         stream = self._store._stream
         stream.seek(self._start + self._position)
-        written = stream.write(b)
-        self._position += written
-        if self._position > self._length:
-            self._length = self._position
-        return written
+        view = memoryview(b)
+        total_written = 0
+        while total_written < len(view):
+            written = stream.write(view[total_written:])
+            if not written:
+                raise OSError("Unable to write the complete spill segment")
+            total_written += written
+            self._position += written
+            if self._position > self._length:
+                self._length = self._position
+        return total_written
 
     def flush(self) -> None:
         self._store._stream.flush()
@@ -317,7 +323,7 @@ class AppendOnlySpillStore:
     ):
         fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=dir)
         self.path = path
-        self._stream = os.fdopen(fd, "w+b")
+        self._stream = os.fdopen(fd, "w+b", buffering=0)
         self._closed = False
 
     def _reserve_segment(self) -> int:
@@ -331,12 +337,30 @@ class AppendOnlySpillStore:
     def slice(self, offset: int, size: int) -> SpillStoreSliceReplacer:
         return SpillStoreSliceReplacer(self, offset, size)
 
+    def discard_segment(self, segment: _AppendSegmentIO) -> bool:
+        if self._closed or segment._store is not self:
+            return False
+        self._stream.seek(0, os.SEEK_END)
+        if self._stream.tell() != segment.start + segment.length:
+            return False
+        self._stream.truncate(segment.start)
+        return True
+
     def append_bytes(self, data: bytes | bytearray | memoryview) -> SpillStoreSliceReplacer:
         writer, segment = self.create_writer()
         try:
             writer.write(data)
-        finally:
             writer.dispose()
+        except BaseException:
+            try:
+                writer.dispose()
+            except BaseException:
+                pass
+            try:
+                self.discard_segment(segment)
+            except OSError:
+                pass
+            raise
         return self.slice(segment.start, segment.length)
 
     def read_range(self, offset: int, size: int) -> bytes:

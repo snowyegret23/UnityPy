@@ -37,7 +37,8 @@ class ContainerHelper:
             size = info.preloadSize
             if start < 0 or size <= 0 or start + size > len(self._preload_table):
                 continue
-            for pptr in self._preload_table[start : start + size]:
+            for index in range(start, start + size):
+                pptr = self._preload_table[index]
                 if not pptr:
                     continue
                 try:
