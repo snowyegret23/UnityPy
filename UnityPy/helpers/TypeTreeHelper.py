@@ -143,8 +143,21 @@ def read_typetree(
     """
     bytes_read: int
     if byte_size and read_typetree_boost:
+        pos = reader.Position
         data = reader.read_bytes(byte_size)
-        obj, bytes_read = read_typetree_boost(data, root_node, reader.endian, as_dict, assetsfile, classes)
+        obj, bytes_read = read_typetree_boost(
+            data, root_node, reader.endian, as_dict, assetsfile, classes
+        )
+        if not 0 <= bytes_read <= byte_size:
+            raise ValueError(
+                f"Native TypeTree reader returned invalid byte count {bytes_read} "
+                f"for a {byte_size}-byte object"
+            )
+        # The native reader receives an isolated byte buffer, so advancing the
+        # Python reader by byte_size does not reflect how much of the TypeTree
+        # was actually consumed when check_read is disabled. Match the pure
+        # Python path and leave unread trailing object data accessible.
+        reader.Position = pos + bytes_read
     else:
         pos = reader.Position
         config = TypeTreeConfig(as_dict, assetsfile, False)

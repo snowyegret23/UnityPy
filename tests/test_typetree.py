@@ -3,10 +3,12 @@ import math
 import os
 import random
 from typing import List, Tuple, Type, TypeVar, Union
+from unittest.mock import patch
 
 import psutil
 
 from UnityPy.classes.generated import GameObject
+from UnityPy.helpers import TypeTreeHelper
 from UnityPy.helpers.Tpk import get_typetree_node
 from UnityPy.helpers.TypeTreeHelper import read_typetree, write_typetree
 from UnityPy.helpers.TypeTreeNode import TypeTreeNode
@@ -189,6 +191,28 @@ def test_class_node_clz():
     raw = writer.bytes
     re_value = _test_read_typetree(TEST_CLASS_NODE, raw, as_dict=False)
     assert re_value == TEST_CLASS_NODE_OBJ
+
+
+def test_boost_reader_position_tracks_consumed_bytes():
+    reader = EndianBinaryReader(b"\x01\x02trailing", "<")
+    node = generate_dummy_node("UInt8")
+
+    with patch.object(
+        TypeTreeHelper,
+        "read_typetree_boost",
+        return_value=({"value": 1}, 2),
+    ):
+        value = TypeTreeHelper.read_typetree(
+            node,
+            reader,
+            as_dict=True,
+            byte_size=10,
+            check_read=False,
+        )
+
+    assert value == {"value": 1}
+    assert reader.Position == 2
+    assert reader.read_bytes(8) == b"trailing"
 
 
 def test_node_from_list_clz():
