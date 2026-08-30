@@ -6,8 +6,9 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 from attrs import define
 
 from .. import config
-from ..enums import BuildTarget, ClassIDType, CommonString
+from ..enums import BuildTarget, ClassIDType
 from ..helpers.ContainerHelper import ContainerHelper
+from ..helpers.Tpk import get_common_strings
 from ..helpers.TypeTreeHelper import TypeTreeNode
 from ..helpers.UnityVersion import UnityVersion
 from ..streams import EndianBinaryWriter
@@ -570,4 +571,4 @@ def read_string(string_buffer_reader: EndianBinaryReader, value: int) -> str:
         return string_buffer_reader.read_string_to_null()
 
     offset = value & 0x7FFFFFFF
-    return CommonString.get(offset, str(offset))
+    return get_common_strings().get(offset, str(offset))

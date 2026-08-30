@@ -10,11 +10,11 @@ from typing import Dict, List, Optional, Set, Tuple
 # import UnityPy from the parent directory instead of the installed package
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT)
-from UnityPy.helpers.Tpk import TPKTYPETREE, TpkUnityNode  # noqa: E402
+from UnityPy.helpers.Tpk import TpkUnityNode, get_typetree  # noqa: E402
 from UnityPy.helpers.TypeTreeNode import clean_name  # noqa: E402
 
-NODES = TPKTYPETREE.NodeBuffer
-STRINGS = TPKTYPETREE.StringBuffer
+NODES = get_typetree().NodeBuffer
+STRINGS = get_typetree().StringBuffer
 
 BASE_TYPE_MAP = {
     "char": "int",  # used for byte data
@@ -310,7 +310,7 @@ def generate_classes():
     main_classes: Set[str] = set()
     deps: Dict[str, List[str]] = {}
 
-    for _class_id, class_info in TPKTYPETREE.ClassInformation.items():
+    for _class_id, class_info in get_typetree().ClassInformation.items():
         abstract = True
         base = None
         cls_name: Optional[str] = None

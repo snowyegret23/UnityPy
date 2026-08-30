@@ -52,6 +52,8 @@ dependencies = [
     "fsspec",
     # better classes
     "attrs",
+    # tpk handling
+    "tpk_ar"
 ]
 dynamic = ["version"]
 

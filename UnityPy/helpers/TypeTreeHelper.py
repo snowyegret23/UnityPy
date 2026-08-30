@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from sys import version_info as py_version_info
 from typing import TYPE_CHECKING, Any, Optional, Union
 
@@ -277,7 +276,7 @@ def read_value_array(
     elif node.m_Type == "string":
         value = [reader.read_aligned_string() for _ in range(size)]
     elif node.m_Type == "TypelessData":
-        value = [reader.read_bytes() for _ in range(size)]
+        value = [reader.read_byte_array() for _ in range(size)]
     elif node.m_Type == "pair":
         key_node = node.m_Children[0]
         value_node = node.m_Children[1]
@@ -363,19 +362,6 @@ def read_value_array(
 
 def metaflag_is_aligned(meta_flag: int | None) -> bool:
     return ((meta_flag or 0) & kAlignBytes) != 0
-
-
-def clean_name(name: str) -> str:
-    if name.startswith("(int&)"):
-        name = name[6:]
-    if name.endswith("?"):
-        name = name[:-1]
-    name = re.sub(r"[ \.:\-\[\]]", "_", name)
-    if name in ["pass", "from"]:
-        name += "_"
-    if name[0].isdigit():
-        name = f"x{name}"
-    return name
 
 
 FUNCTION_WRITE_MAP = {

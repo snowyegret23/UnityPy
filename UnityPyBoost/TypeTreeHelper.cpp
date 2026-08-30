@@ -40,11 +40,8 @@ std::string clean_name(const std::string &name)
         cleaned_name = cleaned_name.substr(6);
     }
 
-    // Remove trailing "?"
-    if (!cleaned_name.empty() && cleaned_name.back() == '?')
-    {
-        cleaned_name.pop_back();
-    }
+    // Remove certain characters
+    cleaned_name = std::regex_replace(cleaned_name, std::regex("[\\?\\*]"), "");
 
     // Replace certain characters with "_"
     cleaned_name = std::regex_replace(cleaned_name, std::regex("[ \\.:\\-\\[\\]]"), "_");
